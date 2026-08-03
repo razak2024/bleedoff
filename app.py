@@ -1060,7 +1060,7 @@ with tabs[6]:
                 def _style_severity(val):
                     return SEVERITY_COLORS.get(val, "")
 
-                styled = table_df.style.applymap(_style_severity, subset=sev_cols_present)
+                styled = table_df.style.map(_style_severity, subset=sev_cols_present)
                 st.dataframe(styled, use_container_width=True, height=480)
 
                 csv_out = table_df.to_csv(index=False).encode("utf-8")

@@ -10,6 +10,8 @@ This tool assists field/engineering personnel in:
   - Automatically applying the qualitative diagnostic logic of 10.2.2 / 10.3.2
   - Visualizing the pressure-time history against MAWOP / DT reference lines
   - Producing a documentation-ready test report (Section 11.3)
+  - Screening a multi-well pressure survey (Excel upload) and classifying wells
+    by annular pressure severity
 
 DISCLAIMER: This tool implements the qualitative decision logic described in
 API RP 90-2 to aid diagnostics and documentation. It does not replace sound
@@ -17,11 +19,13 @@ engineering judgment, applicable regulations, or a qualified person's review.
 """
 
 import io
+import re
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 import streamlit as st
 
 # --------------------------------------------------------------------------------------
@@ -165,6 +169,7 @@ tabs = st.tabs(
         "4️⃣ Thermal Screening (§10.3)",
         "5️⃣ Chart",
         "6️⃣ Report / Export",
+        "7️⃣ Pressure Survey",
     ]
 )
 
@@ -697,3 +702,379 @@ with tabs[5]:
             file_name=f"ACP_test_data_{well_name or 'well'}_{annulus_id}_{test_date}.csv",
             mime="text/csv",
         )
+
+# --------------------------------------------------------------------------------------
+# Pressure Survey — helper functions
+# --------------------------------------------------------------------------------------
+# Canonical field -> list of normalized aliases that may appear in the uploaded workbook's
+# header row (oil template and gas template use the same field set in a different column
+# order, plus some accented/French variants).
+SURVEY_COLUMN_ALIASES = {
+    "wellbore": ["wellbore", "puits", "well"],
+    "date": ["date"],
+    "redacteur": ["redacteur", "author", "redactor"],
+    "state": ["state", "etat"],
+    "choke": ["choke"],
+    "hrs_sce": ["hrssce", "hrs", "hoursonstream", "heuresce"],
+    "whp": ["whp"],
+    "paval": ["paval"],
+    "wht": ["wht"],
+    "anp1": ["anp1"],
+    "anp2": ["anp2"],
+    "anp3": ["anp3"],
+    "comment": ["comment", "commentaire", "commentaires"],
+}
+
+SEVERITY_ORDER = ["Not Monitored", "Normal", "Low", "Moderate", "High", "Severe", "Critical"]
+SEVERITY_RANK = {name: i for i, name in enumerate(SEVERITY_ORDER)}
+
+SEVERITY_COLORS = {
+    "Not Monitored": "background-color: #eeeeee; color: #888888",
+    "Normal": "background-color: #d4edda; color: #155724",
+    "Low": "background-color: #fff3cd; color: #7a5b00",
+    "Moderate": "background-color: #ffe0b2; color: #7a3e00",
+    "High": "background-color: #f8d7da; color: #7a1c24",
+    "Severe": "background-color: #f1948a; color: #4a0d0d",
+    "Critical": "background-color: #dc3545; color: #ffffff; font-weight: 700",
+}
+
+
+def _normalize_header(value):
+    """Normalize a raw header cell to a bare lowercase alnum token for matching."""
+    s = str(value).strip().lower()
+    s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("à", "a")
+    s = re.sub(r"\(.*?\)", "", s)  # drop parenthetical units, e.g. "Whp (Psig)" -> "whp "
+    s = re.sub(r"[^a-z0-9]", "", s)
+    return s
+
+
+def _parse_numeric(val):
+    """Parse a cell that may be a real number, blank, or French-formatted text
+    (e.g. '1 578,00', '800,00') into a float, else NaN."""
+    if val is None:
+        return np.nan
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return float(val) if not pd.isna(val) else np.nan
+    s = str(val).strip()
+    if s == "" or s.lower() in ("nan", "none", "-", "n/a"):
+        return np.nan
+    s = s.replace("\xa0", " ").replace(" ", "")
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
+def find_header_row(raw_df, max_scan_rows=10):
+    """Scan the first few rows of a headerless read for the row that looks like the
+    real header (contains a token like 'wellbore' or 'whp')."""
+    for i in range(min(max_scan_rows, len(raw_df))):
+        row_tokens = {_normalize_header(v) for v in raw_df.iloc[i].tolist()}
+        if "wellbore" in row_tokens or "whp" in row_tokens:
+            return i
+    return 0
+
+
+def load_survey_workbook(uploaded_file, sheet_name=0):
+    """Load an oil- or gas-template survey workbook and return a normalized DataFrame
+    with canonical columns: wellbore, date, state, whp, paval, wht, anp1, anp2, anp3, comment."""
+    uploaded_file.seek(0)
+    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, dtype=object)
+    header_row = find_header_row(raw)
+
+    uploaded_file.seek(0)
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=header_row)
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
+
+    colmap = {}
+    used_canonical = set()
+    for col in df.columns:
+        norm = _normalize_header(col)
+        for canonical, aliases in SURVEY_COLUMN_ALIASES.items():
+            if canonical in used_canonical:
+                continue
+            if norm in aliases or any(norm.startswith(a) for a in aliases):
+                colmap[col] = canonical
+                used_canonical.add(canonical)
+                break
+
+    df = df.rename(columns=colmap)
+    keep_cols = [c for c in SURVEY_COLUMN_ALIASES if c in df.columns]
+    df = df[keep_cols].copy()
+
+    # Ensure every canonical field exists even if the workbook omitted it
+    for canonical in SURVEY_COLUMN_ALIASES:
+        if canonical not in df.columns:
+            df[canonical] = np.nan
+
+    if "wellbore" in df.columns:
+        df = df.dropna(subset=["wellbore"])
+        df["wellbore"] = df["wellbore"].astype(str).str.strip()
+
+    for numcol in ("whp", "paval", "wht", "anp1", "anp2", "anp3", "choke", "hrs_sce"):
+        df[numcol] = df[numcol].apply(_parse_numeric)
+
+    if "state" in df.columns:
+        df["state"] = df["state"].apply(
+            lambda v: str(v).strip().title() if pd.notna(v) and str(v).strip() != "" else "Unknown"
+        )
+
+    return df.reset_index(drop=True)
+
+
+def classify_annulus_pressure(pressure, normal_thr, low_thr, mod_thr, high_thr):
+    """Classify a single annulus reading into a severity band based on absolute pressure."""
+    if pd.isna(pressure):
+        return "Not Monitored"
+    if pressure <= normal_thr:
+        return "Normal"
+    elif pressure <= low_thr:
+        return "Low"
+    elif pressure <= mod_thr:
+        return "Moderate"
+    elif pressure <= high_thr:
+        return "High"
+    else:
+        return "Severe"
+
+
+def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
+    """Apply per-annulus severity classification plus the Annulus-A-near-WHP critical
+    override (possible tubing-to-A-annulus communication / barrier failure) to a
+    normalized survey DataFrame."""
+    out = df.copy()
+
+    for label, col in (("A", "anp1"), ("B", "anp2"), ("C", "anp3")):
+        out[f"sev_{label}"] = out[col].apply(
+            lambda p: classify_annulus_pressure(p, normal_thr, low_thr, mod_thr, high_thr)
+        )
+
+    def a_near_whp(row):
+        whp = row.get("whp")
+        anp_a = row.get("anp1")
+        if pd.isna(whp) or pd.isna(anp_a) or whp <= 0:
+            return False
+        return anp_a >= near_whp_ratio * whp
+
+    out["A_near_WHP"] = out.apply(a_near_whp, axis=1)
+
+    def overall(row):
+        sevs = [row["sev_A"], row["sev_B"], row["sev_C"]]
+        ranked = [SEVERITY_RANK[s] for s in sevs if s != "Not Monitored"]
+        base = SEVERITY_ORDER[max(ranked)] if ranked else "Not Monitored"
+        if row["A_near_WHP"]:
+            return "Critical"
+        return base
+
+    out["Well_Classification"] = out.apply(overall, axis=1)
+
+    def flag_text(row):
+        flags = []
+        if row["A_near_WHP"]:
+            whp = row.get("whp")
+            anp_a = row.get("anp1")
+            ratio_pct = (anp_a / whp * 100.0) if whp else float("nan")
+            flags.append(
+                f"A-annulus ({anp_a:.0f} psig) is ≥{near_whp_ratio*100:.0f}% of WHP "
+                f"({whp:.0f} psig) — {ratio_pct:.0f}% — possible tubing-to-A-annulus "
+                f"communication / barrier failure."
+            )
+        return " ".join(flags)
+
+    out["Flags"] = out.apply(flag_text, axis=1)
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Tab 7 — Pressure Survey (multi-well Excel screening)
+# --------------------------------------------------------------------------------------
+with tabs[6]:
+    st.subheader("Multi-Well Pressure Survey — Severity Screening")
+    st.markdown(
+        "Upload a daily/periodic well survey workbook (oil or gas template — column order "
+        "doesn't matter, columns are matched by name) to automatically screen every well's "
+        "annuli (A/B/C = ANP1/ANP2/ANP3) against WHP and severity thresholds."
+    )
+    st.caption(
+        "Rule of thumb applied: if the **A-annulus pressure is equal to or approaches WHP**, "
+        "the well is flagged **Critical** (possible tubing-to-A-annulus communication / "
+        "barrier failure), independent of the absolute severity bands below."
+    )
+
+    survey_file = st.file_uploader(
+        "Upload well survey Excel file (.xlsx / .xls)", type=["xlsx", "xls"], key="survey_uploader"
+    )
+
+    with st.expander("⚙️ Classification thresholds", expanded=False):
+        st.markdown("**Annulus-A “near WHP” critical rule**")
+        near_whp_ratio_pct = st.slider(
+            "Flag Critical when ANP1 (A-annulus) ≥ this % of WHP",
+            min_value=50, max_value=100, value=80, step=5,
+        )
+        st.markdown("**Absolute severity bands for any annulus (A/B/C), psig**")
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            normal_thr = st.number_input("Normal ≤", min_value=0.0, value=50.0, step=10.0)
+        with b2:
+            low_thr = st.number_input("Low ≤", min_value=0.0, value=150.0, step=10.0)
+        with b3:
+            mod_thr = st.number_input("Moderate ≤", min_value=0.0, value=400.0, step=10.0)
+        with b4:
+            high_thr = st.number_input("High ≤ (Severe above)", min_value=0.0, value=700.0, step=10.0)
+
+    if survey_file is None:
+        st.info("Upload an oil-template or gas-template survey workbook to run the screening.")
+    else:
+        try:
+            xls = pd.ExcelFile(survey_file)
+            sheet = xls.sheet_names[0]
+            if len(xls.sheet_names) > 1:
+                sheet = st.selectbox("Sheet to use", xls.sheet_names)
+            survey_df = load_survey_workbook(survey_file, sheet_name=sheet)
+        except Exception as e:
+            survey_df = None
+            st.error(f"Could not read this workbook: {e}")
+
+        if survey_df is not None:
+            if survey_df.empty:
+                st.warning("No well rows were recognized in this file. Check that a 'Wellbore' column exists.")
+            else:
+                classified = classify_survey(
+                    survey_df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio_pct / 100.0
+                )
+
+                n_total = len(classified)
+                n_critical = int((classified["Well_Classification"] == "Critical").sum())
+                n_high_severe = int(classified["Well_Classification"].isin(["High", "Severe"]).sum())
+                n_normal = int(classified["Well_Classification"].isin(["Normal", "Not Monitored"]).sum())
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Wells screened", n_total)
+                m2.metric("🔴 Critical (A≈WHP)", n_critical)
+                m3.metric("🟠 High / Severe", n_high_severe)
+                m4.metric("🟢 Normal / Not monitored", n_normal)
+
+                st.markdown("---")
+
+                # Well classification distribution chart
+                counts = (
+                    classified["Well_Classification"]
+                    .value_counts()
+                    .reindex(SEVERITY_ORDER)
+                    .dropna()
+                    .reset_index()
+                )
+                counts.columns = ["Classification", "Count"]
+                fig_counts = px.bar(
+                    counts,
+                    x="Classification",
+                    y="Count",
+                    color="Classification",
+                    color_discrete_map={
+                        "Not Monitored": "#bdbdbd",
+                        "Normal": "#28a745",
+                        "Low": "#ffc107",
+                        "Moderate": "#fd7e14",
+                        "High": "#dc3545",
+                        "Severe": "#b21f2d",
+                        "Critical": "#7b0000",
+                    },
+                    category_orders={"Classification": SEVERITY_ORDER},
+                    text="Count",
+                )
+                fig_counts.update_layout(showlegend=False, height=350, margin=dict(t=30))
+                st.plotly_chart(fig_counts, use_container_width=True)
+
+                if n_critical > 0:
+                    st.error(
+                        f"⚠️ {n_critical} well(s) flagged **Critical**: A-annulus pressure is at "
+                        f"or near WHP, suggesting possible tubing-to-A-annulus communication "
+                        f"or barrier failure. These should be prioritized for diagnostic "
+                        f"testing per API RP 90-2 §10."
+                    )
+
+                # WHP vs A-annulus scatter to visualize how close wells are to the critical line
+                scatter_df = classified.dropna(subset=["whp", "anp1"]).copy()
+                if not scatter_df.empty:
+                    fig_scatter = go.Figure()
+                    fig_scatter.add_trace(
+                        go.Scatter(
+                            x=scatter_df["whp"],
+                            y=scatter_df["anp1"],
+                            mode="markers",
+                            text=scatter_df["wellbore"],
+                            marker=dict(
+                                size=10,
+                                color=[
+                                    "#7b0000" if c else "#1f77b4" for c in scatter_df["A_near_WHP"]
+                                ],
+                            ),
+                            hovertemplate="%{text}<br>WHP=%{x:.0f} psig<br>A-Annulus=%{y:.0f} psig<extra></extra>",
+                            name="Wells",
+                        )
+                    )
+                    max_axis = float(max(scatter_df["whp"].max(), scatter_df["anp1"].max())) * 1.05 + 1
+                    fig_scatter.add_trace(
+                        go.Scatter(
+                            x=[0, max_axis],
+                            y=[0, max_axis * (near_whp_ratio_pct / 100.0)],
+                            mode="lines",
+                            line=dict(color="gray", dash="dash"),
+                            name=f"Critical threshold ({near_whp_ratio_pct}% of WHP)",
+                        )
+                    )
+                    fig_scatter.update_layout(
+                        xaxis_title="WHP (psig)",
+                        yaxis_title="A-Annulus / ANP1 (psig)",
+                        height=450,
+                        margin=dict(t=30),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    )
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+                    st.caption(
+                        "Wells above/near the dashed critical threshold line have an A-annulus "
+                        "pressure approaching WHP. Red markers are flagged Critical."
+                    )
+
+                st.markdown("---")
+                st.markdown("##### Classified well table")
+
+                display_cols = {
+                    "wellbore": "Wellbore",
+                    "state": "State",
+                    "whp": "WHP (psig)",
+                    "anp1": "ANP1 / A (psig)",
+                    "sev_A": "A Severity",
+                    "anp2": "ANP2 / B (psig)",
+                    "sev_B": "B Severity",
+                    "anp3": "ANP3 / C (psig)",
+                    "sev_C": "C Severity",
+                    "Well_Classification": "Well Classification",
+                    "Flags": "Flags",
+                }
+                table_df = classified[[c for c in display_cols if c in classified.columns]].rename(columns=display_cols)
+
+                sev_cols_present = [display_cols[c] for c in ("sev_A", "sev_B", "sev_C", "Well_Classification") if c in classified.columns]
+
+                def _style_severity(val):
+                    return SEVERITY_COLORS.get(val, "")
+
+                styled = table_df.style.applymap(_style_severity, subset=sev_cols_present)
+                st.dataframe(styled, use_container_width=True, height=480)
+
+                csv_out = table_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download classified survey (.csv)",
+                    data=csv_out,
+                    file_name=f"pressure_survey_classified_{datetime.now().date()}.csv",
+                    mime="text/csv",
+                )
+
+    st.markdown("---")
+    st.caption(
+        "This screening uses simple, configurable rules (absolute severity bands + an "
+        "A-annulus-vs-WHP proximity check) to triage a well population for further review. "
+        "It is not a substitute for the formal API RP 90-2 §8 Diagnostic Threshold "
+        "methodology or engineering judgment on a per-well basis."
+    )

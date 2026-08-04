@@ -940,10 +940,13 @@ def classify_annulus_pressure(pressure, code, normal_thr, low_thr, mod_thr, high
         return "Severe"
 
 
-def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
-    """Apply per-annulus severity classification plus the Annulus-A-near-WHP critical
-    override (possible tubing-to-A-annulus communication / barrier failure) to a
-    normalized survey DataFrame."""
+def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio, near_ab_ratio, anp_c_critical_thr):
+    """Apply per-annulus severity classification plus three Critical override rules to a
+    normalized survey DataFrame:
+      - A-annulus at/near WHP (possible tubing-to-A-annulus communication / barrier failure)
+      - A-annulus at/near B-annulus pressure (possible A/B annulus communication)
+      - C-annulus pressure above a fixed threshold (possible outer-barrier failure)
+    """
     out = df.copy()
 
     for label, col in (("A", "anp1"), ("B", "anp2"), ("C", "anp3")):
@@ -969,7 +972,39 @@ def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
             return False
         return anp_a >= near_whp_ratio * whp
 
+    def a_near_b(row):
+        anp_a = row.get("anp1")
+        anp_b = row.get("anp2")
+        if pd.isna(anp_a) or pd.isna(anp_b):
+            return False
+        hi, lo = max(anp_a, anp_b), min(anp_a, anp_b)
+        # Both readings near-zero and roughly equal is normal (properly bled annuli),
+        # not evidence of A/B communication — only apply once pressure is above "Normal".
+        if hi <= normal_thr:
+            return False
+        return lo >= near_ab_ratio * hi
+
+    def c_critical(row):
+        anp_c = row.get("anp3")
+        if pd.isna(anp_c):
+            return False
+        return anp_c > anp_c_critical_thr
+
     out["A_near_WHP"] = out.apply(a_near_whp, axis=1)
+    out["A_near_B"] = out.apply(a_near_b, axis=1)
+    out["C_Critical"] = out.apply(c_critical, axis=1)
+
+    def critical_reasons(row):
+        reasons = []
+        if row["A_near_WHP"]:
+            reasons.append("A≈WHP")
+        if row["A_near_B"]:
+            reasons.append("A≈B")
+        if row["C_Critical"]:
+            reasons.append("C-annulus")
+        return reasons
+
+    out["Critical_Reasons"] = out.apply(critical_reasons, axis=1)
 
     def overall(row):
         sevs = [row["sev_A"], row["sev_B"], row["sev_C"]]
@@ -980,7 +1015,7 @@ def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
             base = "Status"
         else:
             base = "Not Monitored"
-        if row["A_near_WHP"]:
+        if row["Critical_Reasons"]:
             return "Critical"
         return base
 
@@ -996,6 +1031,20 @@ def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
                 f"A-annulus ({anp_a:.0f} psig) is ≥{near_whp_ratio*100:.0f}% of WHP "
                 f"({whp:.0f} psig) — {ratio_pct:.0f}% — possible tubing-to-A-annulus "
                 f"communication / barrier failure."
+            )
+        if row["A_near_B"]:
+            anp_a = row.get("anp1")
+            anp_b = row.get("anp2")
+            flags.append(
+                f"A-annulus ({anp_a:.0f} psig) is at/near B-annulus pressure "
+                f"({anp_b:.0f} psig) — possible A/B annulus communication / barrier failure."
+            )
+        if row["C_Critical"]:
+            anp_c = row.get("anp3")
+            flags.append(
+                f"C-annulus pressure ({anp_c:.0f} psig) exceeds the "
+                f"{anp_c_critical_thr:.0f} psig critical threshold — possible outer "
+                f"barrier failure."
             )
         return " ".join(flags)
 
@@ -1017,9 +1066,10 @@ with tabs[6]:
         "automatically; columns are matched by name."
     )
     st.caption(
-        "Rule of thumb applied: if the **A-annulus pressure is equal to or approaches WHP**, "
-        "the well is flagged **Critical** (possible tubing-to-A-annulus communication / "
-        "barrier failure), independent of the absolute severity bands below."
+        "Rule of thumb applied: three independent rules can each flag a well **Critical**, "
+        "regardless of the absolute severity bands below — (1) A-annulus at/near WHP, "
+        "(2) A-annulus at/near B-annulus pressure, and (3) C-annulus pressure above a "
+        "fixed threshold."
     )
     st.caption(
         "The monthly template often records a field status instead of a psig value "
@@ -1033,10 +1083,21 @@ with tabs[6]:
     )
 
     with st.expander("⚙️ Classification thresholds", expanded=False):
-        st.markdown("**Annulus-A “near WHP” critical rule**")
+        st.markdown("**Critical rule 1 — Annulus-A “near WHP”** (possible tubing-to-A communication)")
         near_whp_ratio_pct = st.slider(
             "Flag Critical when ANP1 (A-annulus) ≥ this % of WHP",
             min_value=50, max_value=100, value=80, step=5,
+        )
+        st.markdown("**Critical rule 2 — Annulus-A “near” Annulus-B** (possible A/B communication)")
+        near_ab_ratio_pct = st.slider(
+            "Flag Critical when A-annulus and B-annulus pressures are within this % of each other "
+            "(the smaller ≥ this % of the larger, both > 0 psig)",
+            min_value=50, max_value=100, value=80, step=5,
+        )
+        st.markdown("**Critical rule 3 — Annulus-C pressure detected** (possible outer-barrier failure)")
+        anp_c_critical_thr = st.number_input(
+            "Flag Critical when C-annulus (ANP3 / EA-C) pressure exceeds (psig)",
+            min_value=0.0, value=100.0, step=10.0,
         )
         st.markdown("**Absolute severity bands for any annulus (A/B/C), psig**")
         b1, b2, b3, b4 = st.columns(4)
@@ -1067,7 +1128,8 @@ with tabs[6]:
                 st.warning("No well rows were recognized in this file. Check that a 'Wellbore' column exists.")
             else:
                 classified = classify_survey(
-                    survey_df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio_pct / 100.0
+                    survey_df, normal_thr, low_thr, mod_thr, high_thr,
+                    near_whp_ratio_pct / 100.0, near_ab_ratio_pct / 100.0, anp_c_critical_thr,
                 )
 
                 n_total = len(classified)
@@ -1078,7 +1140,7 @@ with tabs[6]:
 
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Wells screened", n_total)
-                m2.metric("🔴 Critical (A≈WHP)", n_critical)
+                m2.metric("🔴 Critical", n_critical)
                 m3.metric("🟠 High / Severe", n_high_severe)
                 m4.metric("🟢 Normal / Not monitored", n_normal)
                 m5.metric("🔵 Status code only", n_status)
@@ -1117,11 +1179,45 @@ with tabs[6]:
 
                 if n_critical > 0:
                     st.error(
-                        f"⚠️ {n_critical} well(s) flagged **Critical**: A-annulus pressure is at "
-                        f"or near WHP, suggesting possible tubing-to-A-annulus communication "
-                        f"or barrier failure. These should be prioritized for diagnostic "
-                        f"testing per API RP 90-2 §10."
+                        f"⚠️ {n_critical} well(s) flagged **Critical** under one or more rules: "
+                        f"A-annulus at/near WHP, A-annulus at/near B-annulus pressure, or "
+                        f"C-annulus pressure above threshold. These should be prioritized for "
+                        f"diagnostic testing per API RP 90-2 §10."
                     )
+
+                    # Breakdown of WHICH critical rule(s) fired, per annulus case (A/B/C)
+                    reason_labels = {
+                        "A≈WHP": "A-annulus ≈ WHP<br>(tubing↔A communication)",
+                        "A≈B": "A-annulus ≈ B-annulus<br>(A↔B communication)",
+                        "C-annulus": f"C-annulus > {anp_c_critical_thr:.0f} psig<br>(outer barrier)",
+                    }
+                    reason_counts = {k: 0 for k in reason_labels}
+                    for reasons in classified["Critical_Reasons"]:
+                        for r in reasons:
+                            reason_counts[r] = reason_counts.get(r, 0) + 1
+                    reasons_df = pd.DataFrame(
+                        {
+                            "Case": [reason_labels[k] for k in reason_labels],
+                            "Wells flagged": [reason_counts[k] for k in reason_labels],
+                            "Annulus": ["A", "A/B", "C"],
+                        }
+                    )
+                    fig_reasons = px.bar(
+                        reasons_df,
+                        x="Case",
+                        y="Wells flagged",
+                        color="Annulus",
+                        color_discrete_map={"A": "#dc3545", "A/B": "#fd7e14", "C": "#7b0000"},
+                        text="Wells flagged",
+                        title="Critical flags by annulus case (A, A/B, C)",
+                    )
+                    fig_reasons.update_layout(height=380, margin=dict(t=50), xaxis_title=None)
+                    st.plotly_chart(fig_reasons, use_container_width=True)
+                    st.caption(
+                        "A well can be flagged under more than one rule at once, so the bars "
+                        "above can sum to more than the total Critical well count."
+                    )
+
 
                 # WHP vs A-annulus scatter to visualize how close wells are to the critical line
                 scatter_df = classified.dropna(subset=["whp", "anp1"]).copy()
@@ -1136,7 +1232,8 @@ with tabs[6]:
                             marker=dict(
                                 size=10,
                                 color=[
-                                    "#7b0000" if c else "#1f77b4" for c in scatter_df["A_near_WHP"]
+                                    "#7b0000" if c == "Critical" else "#1f77b4"
+                                    for c in scatter_df["Well_Classification"]
                                 ],
                             ),
                             hovertemplate="%{text}<br>WHP=%{x:.0f} psig<br>A-Annulus=%{y:.0f} psig<extra></extra>",
@@ -1169,12 +1266,23 @@ with tabs[6]:
                 st.markdown("---")
                 st.markdown("##### Classified well table")
 
-                show_extra_cols = st.checkbox(
-                    "Show additional columns (Nature, Date, UTM coordinates, Observations)",
-                    value=False,
-                )
+                filt_col, extra_col = st.columns([1, 2])
+                with filt_col:
+                    present_classes = [c for c in SEVERITY_ORDER if c in classified["Well_Classification"].unique()]
+                    severity_filter = st.selectbox(
+                        "Filter by classification",
+                        ["All"] + present_classes,
+                        index=0,
+                    )
+                with extra_col:
+                    show_extra_cols = st.checkbox(
+                        "Show additional columns (Nature, Date, UTM coordinates, Observations)",
+                        value=False,
+                    )
 
                 classified_disp = classified.copy()
+                if severity_filter != "All":
+                    classified_disp = classified_disp[classified_disp["Well_Classification"] == severity_filter]
                 if "date" in classified_disp.columns:
                     classified_disp["date"] = classified_disp["date"].apply(_fmt_date_display)
 
@@ -1202,6 +1310,7 @@ with tabs[6]:
                     display_cols = {**display_cols, **extra_cols}
 
                 table_df = classified_disp[[c for c in display_cols if c in classified_disp.columns]].rename(columns=display_cols)
+                st.caption(f"Showing {len(table_df)} of {n_total} well(s)" + (f" — filtered to **{severity_filter}**." if severity_filter != "All" else "."))
 
                 sev_cols_present = [display_cols[c] for c in ("sev_A", "sev_B", "sev_C", "Well_Classification") if c in display_cols]
 

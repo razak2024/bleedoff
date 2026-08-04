@@ -120,7 +120,7 @@ with st.sidebar.expander("Pre-test Conditions", expanded=True):
 
 with st.sidebar.expander("Tolerances / Test Limits", expanded=False):
     zero_tolerance = st.number_input(
-        "‘Near-zero’ tolerance (psig) used to judge whether pressure bled to 0 psig",
+        "'Near-zero' tolerance (psig) used to judge whether pressure bled to 0 psig",
         min_value=0.0, value=TOLERANCE_DEFAULT, step=1.0,
     )
     max_hours = st.number_input("Maximum cumulative bleed-down time (hours, §10.2.1(k))", min_value=1, value=MAX_HOURS_DEFAULT, step=1)
@@ -713,23 +713,34 @@ SURVEY_COLUMN_ALIASES = {
     "wellbore": ["wellbore", "puits", "well"],
     "date": ["date"],
     "redacteur": ["redacteur", "author", "redactor"],
-    "state": ["state", "etat"],
+    "nature": ["nature"],
+    "state": ["state", "etat", "situation"],
     "choke": ["choke"],
     "hrs_sce": ["hrssce", "hrs", "hoursonstream", "heuresce"],
     "whp": ["whp"],
     "paval": ["paval"],
     "wht": ["wht"],
-    "anp1": ["anp1"],
-    "anp2": ["anp2"],
-    "anp3": ["anp3"],
-    "comment": ["comment", "commentaire", "commentaires"],
+    "anp1": ["anp1", "eaa"],  # "EA-A(PSIG)" -> normalized "eaa"
+    "anp2": ["anp2", "eab"],  # "EA-B(PSIG)" -> normalized "eab"
+    "anp3": ["anp3", "eac"],  # "EA-C(PSIG)" -> normalized "eac"
+    "comment": ["comment", "commentaire", "commentaires", "observation", "observations"],
+    # UTM coordinates are matched via _detect_utm_column() (below) rather than the
+    # generic alias matcher, since the "(X)"/"(Y)" suffix is stripped by
+    # _normalize_header's parenthetical-removal step and would otherwise collide.
+    "utm_x": [],
+    "utm_y": [],
 }
 
-SEVERITY_ORDER = ["Not Monitored", "Normal", "Low", "Moderate", "High", "Severe", "Critical"]
+# Codes used in some field survey templates in place of a numeric psig reading, e.g.
+# "V.B" (vanne bloquée / valve blocked), "M.P" (manque de pression / no pressure gauge
+# or reading), "ENS" (ennoyé / flooded-out gauge), etc. These are qualitative status
+# notes, not pressure values, so they are preserved as-is rather than coerced to a number.
+SEVERITY_ORDER = ["Not Monitored", "Status", "Normal", "Low", "Moderate", "High", "Severe", "Critical"]
 SEVERITY_RANK = {name: i for i, name in enumerate(SEVERITY_ORDER)}
 
 SEVERITY_COLORS = {
     "Not Monitored": "background-color: #eeeeee; color: #888888",
+    "Status": "background-color: #cfe2ff; color: #084298",
     "Normal": "background-color: #d4edda; color: #155724",
     "Low": "background-color: #fff3cd; color: #7a5b00",
     "Moderate": "background-color: #ffe0b2; color: #7a3e00",
@@ -766,6 +777,66 @@ def _parse_numeric(val):
         return np.nan
 
 
+def _parse_numeric_or_code(val):
+    """Parse a pressure cell that may be a real number, blank/placeholder, or a
+    qualitative status code (e.g. 'V.B', 'M.P', 'ENS') used in some field survey
+    templates instead of a psig reading. Returns (numeric_value_or_nan, code_or_none).
+    Blank/placeholder tokens ('', '-', 'n/a', etc.) are treated as simply missing
+    (no code); anything else that isn't parseable as a number is kept as a code."""
+    if val is None:
+        return np.nan, None
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return (float(val) if not pd.isna(val) else np.nan), None
+    s = str(val).strip()
+    if s == "" or s.lower() in ("nan", "none", "-", "n/a"):
+        return np.nan, None
+    s_num = s.replace("\xa0", " ").replace(" ", "").replace(",", ".")
+    try:
+        return float(s_num), None
+    except ValueError:
+        return np.nan, s.upper()
+
+
+def _detect_utm_column(raw_col):
+    """Identify 'Coordonnées UTM (X)' / 'Coordonnées UTM (Y)' style headers, which the
+    generic _normalize_header() can't distinguish because it strips parenthetical
+    content (used elsewhere to drop units like '(psig)')."""
+    s = str(raw_col).strip().lower()
+    s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("à", "a")
+    if "utm" not in s:
+        return None
+    if re.search(r"\(\s*x\s*\)", s) or re.search(r"\bx\s*$", s):
+        return "utm_x"
+    if re.search(r"\(\s*y\s*\)", s) or re.search(r"\by\s*$", s):
+        return "utm_y"
+    return None
+
+
+def _has_code(code):
+    """True if `code` is an actual status-code string (not NaN/None/empty).
+    NaN is truthy in plain Python, so a bare `if code:` check is not safe here —
+    pandas stores a missing object-column value as NaN, not None, in many cases."""
+    return pd.notna(code) and str(code).strip() != ""
+
+
+def _fmt_pressure_display(value, code):
+    """Format a pressure cell for table display: the status code if present
+    (e.g. 'V.B'), else the numeric psig value, else blank."""
+    if _has_code(code):
+        return code
+    if pd.isna(value):
+        return ""
+    return f"{value:.0f}"
+
+
+def _fmt_date_display(value):
+    if pd.isna(value):
+        return ""
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.strftime("%d/%m/%Y")
+    return str(value)
+
+
 def find_header_row(raw_df, max_scan_rows=10):
     """Scan the first few rows of a headerless read for the row that looks like the
     real header (contains a token like 'wellbore' or 'whp')."""
@@ -789,10 +860,20 @@ def load_survey_workbook(uploaded_file, sheet_name=0):
 
     colmap = {}
     used_canonical = set()
+
+    # UTM X/Y need special-case matching first (see _detect_utm_column docstring)
     for col in df.columns:
+        utm_field = _detect_utm_column(col)
+        if utm_field and utm_field not in used_canonical:
+            colmap[col] = utm_field
+            used_canonical.add(utm_field)
+
+    for col in df.columns:
+        if col in colmap:
+            continue
         norm = _normalize_header(col)
         for canonical, aliases in SURVEY_COLUMN_ALIASES.items():
-            if canonical in used_canonical:
+            if canonical in used_canonical or not aliases:
                 continue
             if norm in aliases or any(norm.startswith(a) for a in aliases):
                 colmap[col] = canonical
@@ -812,19 +893,39 @@ def load_survey_workbook(uploaded_file, sheet_name=0):
         df = df.dropna(subset=["wellbore"])
         df["wellbore"] = df["wellbore"].astype(str).str.strip()
 
+    # Pressure fields may contain either a numeric psig value or a qualitative status
+    # code (e.g. 'V.B', 'M.P', 'ENS'); keep both so the code can still be displayed.
     for numcol in ("whp", "paval", "wht", "anp1", "anp2", "anp3", "choke", "hrs_sce"):
-        df[numcol] = df[numcol].apply(_parse_numeric)
+        parsed = df[numcol].apply(_parse_numeric_or_code)
+        df[numcol] = parsed.apply(lambda t: t[0])
+        df[f"{numcol}_code"] = parsed.apply(lambda t: t[1])
+
+    for coordcol in ("utm_x", "utm_y"):
+        df[coordcol] = df[coordcol].apply(_parse_numeric)
 
     if "state" in df.columns:
         df["state"] = df["state"].apply(
             lambda v: str(v).strip().title() if pd.notna(v) and str(v).strip() != "" else "Unknown"
         )
 
+    if "nature" in df.columns:
+        df["nature"] = df["nature"].apply(
+            lambda v: str(v).strip().upper() if pd.notna(v) and str(v).strip() != "" else ""
+        )
+
+    if "comment" in df.columns:
+        df["comment"] = df["comment"].apply(lambda v: str(v).strip() if pd.notna(v) else "")
+
     return df.reset_index(drop=True)
 
 
-def classify_annulus_pressure(pressure, normal_thr, low_thr, mod_thr, high_thr):
-    """Classify a single annulus reading into a severity band based on absolute pressure."""
+def classify_annulus_pressure(pressure, code, normal_thr, low_thr, mod_thr, high_thr):
+    """Classify a single annulus reading into a severity band based on absolute pressure.
+    If a qualitative status code was recorded instead of a number (e.g. 'V.B', 'M.P',
+    'ENS'), the reading is flagged 'Status' rather than banded numerically, since its
+    magnitude isn't known."""
+    if _has_code(code):
+        return "Status"
     if pd.isna(pressure):
         return "Not Monitored"
     if pressure <= normal_thr:
@@ -846,9 +947,20 @@ def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
     out = df.copy()
 
     for label, col in (("A", "anp1"), ("B", "anp2"), ("C", "anp3")):
-        out[f"sev_{label}"] = out[col].apply(
-            lambda p: classify_annulus_pressure(p, normal_thr, low_thr, mod_thr, high_thr)
+        code_col = f"{col}_code"
+        out[f"sev_{label}"] = out.apply(
+            lambda row: classify_annulus_pressure(
+                row[col], row.get(code_col), normal_thr, low_thr, mod_thr, high_thr
+            ),
+            axis=1,
         )
+        out[f"{col}_disp"] = out.apply(
+            lambda row: _fmt_pressure_display(row[col], row.get(code_col)), axis=1
+        )
+
+    out["whp_disp"] = out.apply(
+        lambda row: _fmt_pressure_display(row["whp"], row.get("whp_code")), axis=1
+    )
 
     def a_near_whp(row):
         whp = row.get("whp")
@@ -861,8 +973,13 @@ def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
 
     def overall(row):
         sevs = [row["sev_A"], row["sev_B"], row["sev_C"]]
-        ranked = [SEVERITY_RANK[s] for s in sevs if s != "Not Monitored"]
-        base = SEVERITY_ORDER[max(ranked)] if ranked else "Not Monitored"
+        ranked = [SEVERITY_RANK[s] for s in sevs if s not in ("Not Monitored", "Status")]
+        if ranked:
+            base = SEVERITY_ORDER[max(ranked)]
+        elif "Status" in sevs:
+            base = "Status"
+        else:
+            base = "Not Monitored"
         if row["A_near_WHP"]:
             return "Critical"
         return base
@@ -892,14 +1009,23 @@ def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio):
 with tabs[6]:
     st.subheader("Multi-Well Pressure Survey — Severity Screening")
     st.markdown(
-        "Upload a daily/periodic well survey workbook (oil or gas template — column order "
-        "doesn't matter, columns are matched by name) to automatically screen every well's "
-        "annuli (A/B/C = ANP1/ANP2/ANP3) against WHP and severity thresholds."
+        "Upload a well survey workbook — a **daily/periodic survey** (oil or gas template) "
+        "or a **monthly survey** (Puits / Coordonnées UTM / Nature / Situation / WHP / "
+        "EA-A / EA-B / EA-C / Date de relevé / Observations) — to automatically screen "
+        "every well's annuli (A/B/C = ANP1/ANP2/ANP3, or EA-A/EA-B/EA-C) against WHP and "
+        "severity thresholds. Column order doesn't matter and both templates are handled "
+        "automatically; columns are matched by name."
     )
     st.caption(
         "Rule of thumb applied: if the **A-annulus pressure is equal to or approaches WHP**, "
         "the well is flagged **Critical** (possible tubing-to-A-annulus communication / "
         "barrier failure), independent of the absolute severity bands below."
+    )
+    st.caption(
+        "The monthly template often records a field status instead of a psig value "
+        "(e.g. **V.B**, **M.P**, **ENS**) when a gauge is blocked, missing, or flooded-out. "
+        "These are preserved and shown as-is rather than treated as a pressure reading — "
+        "such cells are flagged **Status** (blue) instead of a numeric severity band."
     )
 
     survey_file = st.file_uploader(
@@ -948,12 +1074,14 @@ with tabs[6]:
                 n_critical = int((classified["Well_Classification"] == "Critical").sum())
                 n_high_severe = int(classified["Well_Classification"].isin(["High", "Severe"]).sum())
                 n_normal = int(classified["Well_Classification"].isin(["Normal", "Not Monitored"]).sum())
+                n_status = int((classified["Well_Classification"] == "Status").sum())
 
-                m1, m2, m3, m4 = st.columns(4)
+                m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Wells screened", n_total)
                 m2.metric("🔴 Critical (A≈WHP)", n_critical)
                 m3.metric("🟠 High / Severe", n_high_severe)
                 m4.metric("🟢 Normal / Not monitored", n_normal)
+                m5.metric("🔵 Status code only", n_status)
 
                 st.markdown("---")
 
@@ -973,6 +1101,7 @@ with tabs[6]:
                     color="Classification",
                     color_discrete_map={
                         "Not Monitored": "#bdbdbd",
+                        "Status": "#4a86e8",
                         "Normal": "#28a745",
                         "Low": "#ffc107",
                         "Moderate": "#fd7e14",
@@ -1040,22 +1169,41 @@ with tabs[6]:
                 st.markdown("---")
                 st.markdown("##### Classified well table")
 
+                show_extra_cols = st.checkbox(
+                    "Show additional columns (Nature, Date, UTM coordinates, Observations)",
+                    value=False,
+                )
+
+                classified_disp = classified.copy()
+                if "date" in classified_disp.columns:
+                    classified_disp["date"] = classified_disp["date"].apply(_fmt_date_display)
+
                 display_cols = {
                     "wellbore": "Wellbore",
-                    "state": "State",
-                    "whp": "WHP (psig)",
-                    "anp1": "ANP1 / A (psig)",
+                    "nature": "Nature",
+                    "state": "Situation / State",
+                    "whp_disp": "WHP (psig)",
+                    "anp1_disp": "ANP1 / A (psig)",
                     "sev_A": "A Severity",
-                    "anp2": "ANP2 / B (psig)",
+                    "anp2_disp": "ANP2 / B (psig)",
                     "sev_B": "B Severity",
-                    "anp3": "ANP3 / C (psig)",
+                    "anp3_disp": "ANP3 / C (psig)",
                     "sev_C": "C Severity",
                     "Well_Classification": "Well Classification",
                     "Flags": "Flags",
                 }
-                table_df = classified[[c for c in display_cols if c in classified.columns]].rename(columns=display_cols)
+                extra_cols = {
+                    "date": "Date",
+                    "utm_x": "UTM X",
+                    "utm_y": "UTM Y",
+                    "comment": "Observations",
+                }
+                if show_extra_cols:
+                    display_cols = {**display_cols, **extra_cols}
 
-                sev_cols_present = [display_cols[c] for c in ("sev_A", "sev_B", "sev_C", "Well_Classification") if c in classified.columns]
+                table_df = classified_disp[[c for c in display_cols if c in classified_disp.columns]].rename(columns=display_cols)
+
+                sev_cols_present = [display_cols[c] for c in ("sev_A", "sev_B", "sev_C", "Well_Classification") if c in display_cols]
 
                 def _style_severity(val):
                     return SEVERITY_COLORS.get(val, "")

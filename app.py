@@ -916,7 +916,41 @@ def load_survey_workbook(uploaded_file, sheet_name=0):
     if "comment" in df.columns:
         df["comment"] = df["comment"].apply(lambda v: str(v).strip() if pd.notna(v) else "")
 
+    # Parse the date column to real datetimes where possible, so "most recent day"
+    # can be determined reliably regardless of how Excel stored/typed the cell.
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
     return df.reset_index(drop=True)
+
+
+def latest_reading_per_well(df):
+    """Collapse a (possibly multi-date, daily-survey) DataFrame down to one row per
+    wellbore — the most recently dated reading. Wells with no usable date keep their
+    last row in file order (best-effort fallback). Also flags, per well, whether more
+    than one date was seen (i.e., this is genuinely a time-series upload)."""
+    if df.empty or "wellbore" not in df.columns:
+        return df.copy(), False
+
+    has_dates = df["date"].notna().any() if "date" in df.columns else False
+    n_dates_per_well = df.groupby("wellbore")["date"].nunique() if has_dates else pd.Series(dtype=int)
+    is_history_upload = bool(has_dates and (n_dates_per_well.max() > 1))
+
+    if has_dates:
+        # keep the max-date row per well; ties broken by original row order
+        df = df.copy()
+        df["_orig_order"] = range(len(df))
+        idx = (
+            df.sort_values(["wellbore", "date", "_orig_order"])
+            .groupby("wellbore", as_index=False)
+            .tail(1)
+            .index
+        )
+        latest = df.loc[idx].drop(columns="_orig_order").reset_index(drop=True)
+    else:
+        latest = df.groupby("wellbore", as_index=False).tail(1).reset_index(drop=True)
+
+    return latest, is_history_upload
 
 
 def classify_annulus_pressure(pressure, code, normal_thr, low_thr, mod_thr, high_thr):
@@ -1077,6 +1111,11 @@ with tabs[6]:
         "These are preserved and shown as-is rather than treated as a pressure reading — "
         "such cells are flagged **Status** (blue) instead of a numeric severity band."
     )
+    st.caption(
+        "📅 If your file has **daily readings** (several dates per well), classification "
+        "and the Critical flags below are always based on each well's **most recent day**. "
+        "Pick a well further down to see its full pressure-over-time history."
+    )
 
     survey_file = st.file_uploader(
         "Upload well survey Excel file (.xlsx / .xls)", type=["xlsx", "xls"], key="survey_uploader"
@@ -1118,15 +1157,27 @@ with tabs[6]:
             sheet = xls.sheet_names[0]
             if len(xls.sheet_names) > 1:
                 sheet = st.selectbox("Sheet to use", xls.sheet_names)
-            survey_df = load_survey_workbook(survey_file, sheet_name=sheet)
+            survey_df_full = load_survey_workbook(survey_file, sheet_name=sheet)
         except Exception as e:
-            survey_df = None
+            survey_df_full = None
             st.error(f"Could not read this workbook: {e}")
 
-        if survey_df is not None:
-            if survey_df.empty:
+        if survey_df_full is not None:
+            if survey_df_full.empty:
                 st.warning("No well rows were recognized in this file. Check that a 'Wellbore' column exists.")
             else:
+                # Collapse to one row per well (most recent date) for classification,
+                # while keeping the full history (survey_df_full) around for the chart.
+                survey_df, is_history_upload = latest_reading_per_well(survey_df_full)
+
+                if is_history_upload:
+                    n_days_total = survey_df_full["date"].nunique()
+                    st.success(
+                        f"📅 Daily pressure data detected — **{n_days_total} distinct date(s)** "
+                        f"across the file. Classification below uses each well's **most recent** "
+                        f"reading; use the well picker further down for the full history plot."
+                    )
+
                 classified = classify_survey(
                     survey_df, normal_thr, low_thr, mod_thr, high_thr,
                     near_whp_ratio_pct / 100.0, near_ab_ratio_pct / 100.0, anp_c_critical_thr,
@@ -1263,6 +1314,81 @@ with tabs[6]:
                         "pressure approaching WHP. Red markers are flagged Critical."
                     )
 
+                # ------------------------------------------------------------------
+                # Pressure-over-time plot for a single, selected well
+                # ------------------------------------------------------------------
+                st.markdown("---")
+                st.markdown("##### 📈 Pressure monitoring over time — single well")
+
+                wells_with_history = []
+                if is_history_upload:
+                    hist_counts = survey_df_full.dropna(subset=["date"]).groupby("wellbore")["date"].nunique()
+                    wells_with_history = sorted(hist_counts[hist_counts > 1].index.tolist())
+
+                if not is_history_upload:
+                    st.caption(
+                        "This file has a single reading per well (no repeated dates), so there is "
+                        "no time history to plot yet. Upload a file with multiple dated readings "
+                        "per well to see a well's pressure trend over time."
+                    )
+                else:
+                    well_options = wells_with_history if wells_with_history else sorted(survey_df_full["wellbore"].unique().tolist())
+                    selected_well = st.selectbox("Select a well", well_options, key="history_well_picker")
+
+                    well_hist = (
+                        survey_df_full[survey_df_full["wellbore"] == selected_well]
+                        .dropna(subset=["date"])
+                        .sort_values("date")
+                        .copy()
+                    )
+
+                    if well_hist.empty:
+                        st.caption("No dated readings available for this well.")
+                    else:
+                        fig_hist = go.Figure()
+                        series_specs = [
+                            ("whp", "WHP", "#000000"),
+                            ("anp1", "A-Annulus (ANP1 / EA-A)", "#dc3545"),
+                            ("anp2", "B-Annulus (ANP2 / EA-B)", "#fd7e14"),
+                            ("anp3", "C-Annulus (ANP3 / EA-C)", "#1f77b4"),
+                        ]
+                        for col, label, color in series_specs:
+                            s = well_hist[["date", col]].dropna(subset=[col])
+                            if s.empty:
+                                continue
+                            fig_hist.add_trace(
+                                go.Scatter(
+                                    x=s["date"],
+                                    y=s[col],
+                                    mode="lines+markers",
+                                    name=label,
+                                    line=dict(color=color),
+                                )
+                            )
+                        fig_hist.add_hline(
+                            y=anp_c_critical_thr, line_dash="dot", line_color="gray",
+                            annotation_text="C-annulus critical threshold", annotation_position="bottom right",
+                        )
+                        fig_hist.update_layout(
+                            xaxis_title="Date",
+                            yaxis_title="Pressure (psig)",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                            height=450,
+                            margin=dict(t=60),
+                        )
+                        st.plotly_chart(fig_hist, use_container_width=True)
+
+                        last_row = well_hist.iloc[-1]
+                        st.caption(
+                            f"Last recorded reading for **{selected_well}**: "
+                            f"{_fmt_date_display(last_row['date'])} — "
+                            f"WHP={_fmt_pressure_display(last_row.get('whp'), last_row.get('whp_code'))} psig, "
+                            f"A={_fmt_pressure_display(last_row.get('anp1'), last_row.get('anp1_code'))}, "
+                            f"B={_fmt_pressure_display(last_row.get('anp2'), last_row.get('anp2_code'))}, "
+                            f"C={_fmt_pressure_display(last_row.get('anp3'), last_row.get('anp3_code'))} "
+                            f"(this is the reading used for classification above)."
+                        )
+
                 st.markdown("---")
                 st.markdown("##### Classified well table")
 
@@ -1301,7 +1427,7 @@ with tabs[6]:
                     "Flags": "Flags",
                 }
                 extra_cols = {
-                    "date": "Date",
+                    "date": "Date" + (" (latest)" if is_history_upload else ""),
                     "utm_x": "UTM X",
                     "utm_y": "UTM Y",
                     "comment": "Observations",

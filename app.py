@@ -12,6 +12,8 @@ This tool assists field/engineering personnel in:
   - Producing a documentation-ready test report (Section 11.3)
   - Screening a multi-well pressure survey (Excel upload) and classifying wells
     by annular pressure severity
+  - Classifying bleed-off results as SCP or thermal effect and comparing them
+    with the current survey pressure of each annulus
 
 DISCLAIMER: This tool implements the qualitative decision logic described in
 API RP 90-2 to aid diagnostics and documentation. It does not replace sound
@@ -1087,6 +1089,238 @@ def classify_survey(df, normal_thr, low_thr, mod_thr, high_thr, near_whp_ratio, 
 
 
 # --------------------------------------------------------------------------------------
+# Bleed-off test results — SCP vs thermal classification
+# Rule: the bleed-down must reduce pressure by >= bleed_frac of the start pressure.
+#   - Pressure returns to its original value (any time)  -> SCP
+#       (within window_h hours = significant leak; later = minor leak)
+#   - Pressure does NOT return, observed >= window_h hours -> Effet thermique
+#   - Pressure does NOT return, observed < window_h hours  -> Indéterminé
+# --------------------------------------------------------------------------------------
+BLEEDOFF_SECTION_TO_ANP = {"eaa": "anp1", "eab": "anp2", "eac": "anp3", "a": "anp1", "b": "anp2", "c": "anp3"}
+ANP_TO_LABEL = {"anp1": "A", "anp2": "B", "anp3": "C"}
+ORIGIN_RANK = {"SCP": 3, "Indéterminé": 2, "Effet thermique": 1, "Données insuffisantes": 0}
+ORIGIN_COLORS = {
+    "SCP": "background-color: #f8d7da; color: #7a1c24; font-weight: 600",
+    "Effet thermique": "background-color: #d1ecf1; color: #0c5460",
+    "Indéterminé": "background-color: #e2e3e5; color: #383d41",
+    "Données insuffisantes": "background-color: #f5f5f5; color: #888888",
+}
+
+
+def _wkey(name):
+    """Well key for cross-file matching: uppercase alphanumerics only (TOU-9 == TOU9)."""
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())
+
+
+def _find_col(columns, keywords):
+    """First column whose normalized header contains every keyword."""
+    for col in columns:
+        norm = _normalize_header(col)
+        if all(k in norm for k in keywords):
+            return col
+    return None
+
+
+def _normalize_ref_type(v):
+    """Map the workbook's 'Annular Casing Pressure Type' label to SCP / Effet thermique."""
+    s = _normalize_header(v) if pd.notna(v) else ""
+    if "scp" in s:
+        return "SCP"
+    if "therm" in s:
+        return "Effet thermique"
+    return "—"
+
+
+def load_bleedoff_workbook(uploaded_file, sheet_name=0):
+    """Read a bleed-off / build-up results workbook into a normalized DataFrame."""
+    uploaded_file.seek(0)
+    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=object)
+    cols = list(raw.columns)
+
+    colmap = {
+        "well": _find_col(cols, ["well"]),
+        "date": _find_col(cols, ["date"]),
+        "section": _find_col(cols, ["section"]),
+        "p0": _find_col(cols, ["start", "pressure"]),
+        "pbleed": _find_col(cols, ["bleed"]),
+        "dp": _find_col(cols, ["drop"]),
+        "bup": _find_col(cols, ["build"]),
+        "hours": _find_col(cols, ["hours"]),
+        "obs": _find_col(cols, ["observation"]),
+        "ref_type": _find_col(cols, ["type"]),
+    }
+    if colmap["well"] is None or colmap["section"] is None or colmap["p0"] is None:
+        raise ValueError("Colonnes requises introuvables : Well, Section, Start Pressure.")
+
+    def col(key):
+        if colmap[key] is None:
+            return pd.Series([np.nan] * len(raw), index=raw.index)
+        return raw[colmap[key]]
+
+    df = pd.DataFrame(index=raw.index)
+    df["wellbore"] = col("well").astype(str).str.strip()
+    df["date"] = pd.to_datetime(col("date"), errors="coerce", dayfirst=True)
+    df["anp"] = col("section").map(_normalize_header).map(BLEEDOFF_SECTION_TO_ANP)
+    df["p0"] = col("p0").apply(_parse_numeric)
+    df["pbleed"] = col("pbleed").apply(_parse_numeric)
+    df["dp"] = col("dp").apply(_parse_numeric)
+    df["bup"] = col("bup").apply(_parse_numeric)
+    df["hours"] = col("hours").apply(_parse_numeric)
+    df["obs"] = col("obs").apply(lambda v: str(v).strip() if pd.notna(v) else "")
+    df["ref_type"] = col("ref_type").apply(_normalize_ref_type)
+
+    df = df[df["anp"].notna() & df["wellbore"].ne("") & df["wellbore"].ne("nan")]
+    return df.reset_index(drop=True)
+
+
+def classify_bleedoff_test(p0, dp, bup, hours, bleed_frac, window_h, recov_tol_pct, no_bleed_pct=1.0):
+    """SCP vs thermal rule for one bleed-off test.
+
+    0. If the pressure does not bleed at all (drop <= no_bleed_pct of start pressure),
+       the leak rate is greater than the bleed rate -> SCP.
+    1. Otherwise, bleed-down must remove at least bleed_frac of the start pressure, else inconclusive.
+    2. If the build-up returns to the original pressure:
+         - within window_h hours -> SCP (significant leak)
+         - after window_h hours  -> SCP (minor leak)
+    3. If it does not return to the original pressure:
+         - observed for >= window_h hours -> Effet thermique
+         - observed for < window_h hours  -> Indéterminé (not enough time observed)
+
+    Returns (origin, bled_pct, recov_pct, basis)."""
+    if pd.isna(p0) or p0 <= 0:
+        return "Données insuffisantes", np.nan, np.nan, "Pression initiale non renseignée"
+    if pd.isna(dp):
+        return "Données insuffisantes", np.nan, np.nan, "Chute de pression non renseignée"
+
+    bled_pct = dp / p0 * 100.0
+    if bled_pct <= no_bleed_pct:
+        return (
+            "SCP", bled_pct, np.nan,
+            f"Pression ne purge pas ({bled_pct:.1f} %) — débit de fuite > débit de purge",
+        )
+    if dp < bleed_frac * p0:
+        return (
+            "Indéterminé", bled_pct, np.nan,
+            f"Purge insuffisante ({bled_pct:.0f} % < {bleed_frac * 100:.0f} %) — test non concluant",
+        )
+
+    if pd.isna(bup):
+        return "Données insuffisantes", bled_pct, np.nan, "Remontée (build-up) non renseignée"
+
+    recov_pct = bup / p0 * 100.0
+    returned = bup >= p0 * (1 - recov_tol_pct / 100.0)
+
+    if returned:
+        if pd.isna(hours) or hours <= window_h:
+            return (
+                "SCP", bled_pct, recov_pct,
+                f"Retour à la pression initiale ({recov_pct:.0f} %) en ≤ {window_h:.0f} h — fuite significative",
+            )
+        return (
+            "SCP", bled_pct, recov_pct,
+            f"Retour à la pression initiale ({recov_pct:.0f} %) après {hours:.0f} h — fuite mineure",
+        )
+
+    if pd.isna(hours):
+        return "Indéterminé", bled_pct, recov_pct, "Durée de build-up non renseignée"
+    if hours >= window_h:
+        return (
+            "Effet thermique", bled_pct, recov_pct,
+            f"Pas de retour à la pression initiale ({recov_pct:.0f} %) après {hours:.0f} h",
+        )
+    return (
+        "Indéterminé", bled_pct, recov_pct,
+        f"Pas de retour à la pression initiale après {hours:.0f} h — observation insuffisante (< {window_h:.0f} h)",
+    )
+
+
+def build_bleedoff_comparison(bleed_df, survey_latest, bleed_frac, window_h, recov_tol_pct, pct_tol, abs_tol, no_bleed_pct=1.0):
+    """Classify the most recent bleed-off test per well/annulus and compare its start
+    pressure with the current survey pressure of the same annulus."""
+    d = bleed_df.copy()
+    d["_wkey"] = d["wellbore"].map(_wkey)
+    d = d.sort_values(["_wkey", "anp", "date"], na_position="first")
+    n_tests = d.groupby(["_wkey", "anp"]).size().rename("n_tests").reset_index()
+    latest = d.groupby(["_wkey", "anp"], as_index=False).tail(1).merge(n_tests, on=["_wkey", "anp"])
+
+    s = survey_latest.copy()
+    s["_wkey"] = s["wellbore"].map(_wkey)
+    s = s.drop_duplicates("_wkey", keep="last").set_index("_wkey")
+
+    rows = []
+    for _, r in latest.iterrows():
+        origin, bled_pct, recov_pct, basis = classify_bleedoff_test(
+            r["p0"], r["dp"], r["bup"], r["hours"], bleed_frac, window_h, recov_tol_pct, no_bleed_pct
+        )
+
+        actual, actual_code, survey_date = np.nan, None, pd.NaT
+        delta, delta_pct, comp = np.nan, np.nan, "Puits absent du relevé"
+        if r["_wkey"] in s.index:
+            srow = s.loc[r["_wkey"]]
+            actual = srow[r["anp"]]
+            actual_code = srow.get(f"{r['anp']}_code")
+            survey_date = srow.get("date", pd.NaT)
+            if _has_code(actual_code):
+                comp = "Non comparable (code de statut)"
+            elif pd.isna(actual):
+                comp = "Pas de lecture actuelle"
+            elif pd.isna(r["p0"]):
+                comp = "Pression d'essai manquante"
+            else:
+                delta = r["p0"] - actual
+                delta_pct = (delta / actual * 100.0) if actual > 0 else np.nan
+                tol = max(abs_tol, pct_tol / 100.0 * actual)
+                comp = "Concordant" if abs(delta) <= tol else "Écart"
+
+        ref = r["ref_type"]
+        if ref == "—" or origin not in ("SCP", "Effet thermique"):
+            agree = "—"
+        else:
+            agree = "Oui" if ref == origin else "Non"
+
+        rows.append({
+            "_wkey": r["_wkey"],
+            "Well": r["wellbore"],
+            "Annulus": ANP_TO_LABEL[r["anp"]],
+            "Test date": r["date"],
+            "Tests on file": int(r["n_tests"]),
+            "Start pressure (psi)": r["p0"],
+            "Bleed-to (psi)": r["pbleed"],
+            "Pressure drop (psi)": r["dp"],
+            "Bled (%)": bled_pct,
+            "Build-up (psi)": r["bup"],
+            "Recovery (%)": recov_pct,
+            "Hours of BUP": r["hours"],
+            "Computed origin": origin,
+            "Basis": basis,
+            "Current survey (psi)": actual if not _has_code(actual_code) else actual_code,
+            "Survey date": survey_date,
+            "Δ test − current (psi)": delta,
+            "Δ %": delta_pct,
+            "Comparison": comp,
+            "Reference type": ref,
+            "Agrees with reference": agree,
+            "_actual_num": actual,
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize_bleedoff_wells(cmp_df):
+    """One row per well: worst origin across its annuli."""
+    out = []
+    for well, g in cmp_df.groupby("Well", sort=True):
+        worst = max(g["Computed origin"], key=lambda o: ORIGIN_RANK.get(o, 0))
+        scp_annuli = g.loc[g["Computed origin"] == "SCP", "Annulus"].tolist()
+        out.append({
+            "Well": well,
+            "Annuli tested": ", ".join(sorted(g["Annulus"].unique())),
+            "Well origin": worst,
+            "SCP annuli": ", ".join(scp_annuli) if scp_annuli else "—",
+        })
+    return pd.DataFrame(out)
+
+
+# --------------------------------------------------------------------------------------
 # Tab 7 — Pressure Survey (multi-well Excel screening)
 # --------------------------------------------------------------------------------------
 with tabs[6]:
@@ -1268,7 +1502,6 @@ with tabs[6]:
                         "A well can be flagged under more than one rule at once, so the bars "
                         "above can sum to more than the total Critical well count."
                     )
-
 
                 # WHP vs A-annulus scatter to visualize how close wells are to the critical line
                 scatter_df = classified.dropna(subset=["whp", "anp1"]).copy()
@@ -1453,6 +1686,155 @@ with tabs[6]:
                     file_name=f"pressure_survey_classified_{datetime.now().date()}.csv",
                     mime="text/csv",
                 )
+
+                # ==========================================================
+                # Bleed-off test results — SCP vs thermal classification
+                # ==========================================================
+                st.markdown("---")
+                st.markdown("##### 🧪 Bleed-off test results — SCP vs thermal classification")
+                st.caption(
+                    "Rule: if the pressure does not bleed at all (leak rate > bleed rate) → **SCP**. "
+                    "Otherwise bleed-down must remove at least 50 % of the start pressure. If the build-up "
+                    "returns to the original pressure → **SCP** (within 24 h = significant leak; "
+                    "later = minor leak). If it does not return to the original pressure after 24 h "
+                    "→ **Effet thermique**."
+                )
+                bleed_file = st.file_uploader(
+                    "Upload bleed-off results Excel file (.xlsx / .xls)",
+                    type=["xlsx", "xls"],
+                    key="bleedoff_uploader",
+                )
+
+                with st.expander("⚙️ Bleed-off rule & comparison thresholds", expanded=False):
+                    r1, r2, r3 = st.columns(3)
+                    with r1:
+                        no_bleed_pct = st.number_input(
+                            "No-bleed limit (% of start pressure; at or below = leak rate > bleed rate → SCP)",
+                            min_value=0.0, value=1.0, step=0.5,
+                        )
+                        bleed_frac_pct = st.slider(
+                            "Minimum bleed-down (% of start pressure)", 10, 100, 50, 5
+                        )
+                        window_h = st.number_input(
+                            "Return window (hours) for SCP", min_value=1.0, value=24.0, step=1.0
+                        )
+                    with r2:
+                        recov_tol_pct = st.number_input(
+                            "Return tolerance (% below start pressure)", min_value=0.0, value=5.0, step=1.0
+                        )
+                    with r3:
+                        pct_tol = st.number_input(
+                            "Match tolerance vs survey (% of survey pressure)", min_value=0.0, value=15.0, step=5.0
+                        )
+                        abs_tol = st.number_input(
+                            "Match tolerance vs survey (psi, minimum)", min_value=0.0, value=20.0, step=5.0
+                        )
+
+                if bleed_file is not None:
+                    try:
+                        bleed_df_full = load_bleedoff_workbook(bleed_file)
+                    except Exception as e:
+                        bleed_df_full = None
+                        st.error(f"Could not read bleed-off workbook: {e}")
+
+                    if bleed_df_full is not None and bleed_df_full.empty:
+                        st.warning("No bleed-off rows were recognized. Check the Well and Section columns.")
+                    elif bleed_df_full is not None:
+                        cmp_df = build_bleedoff_comparison(
+                            bleed_df_full, survey_df,
+                            bleed_frac_pct / 100.0, window_h, recov_tol_pct, pct_tol, abs_tol,
+                            no_bleed_pct,
+                        )
+                        n_cmp = len(cmp_df)
+                        n_scp = int((cmp_df["Computed origin"] == "SCP").sum())
+                        n_th = int((cmp_df["Computed origin"] == "Effet thermique").sum())
+                        n_ind = int((cmp_df["Computed origin"] == "Indéterminé").sum())
+                        n_conc = int((cmp_df["Comparison"] == "Concordant").sum())
+                        decided = cmp_df[cmp_df["Agrees with reference"] != "—"]
+                        agree_rate = (
+                            f"{(decided['Agrees with reference'] == 'Oui').mean() * 100:.0f}%"
+                            if len(decided) else "—"
+                        )
+
+                        b1, b2, b3, b4, b5 = st.columns(5)
+                        b1.metric("Annuli classified", n_cmp)
+                        b2.metric("🔴 SCP", n_scp)
+                        b3.metric("🔵 Thermal effect", n_th)
+                        b4.metric("⚪ Indeterminate", n_ind)
+                        b5.metric("Agreement with file labels", agree_rate)
+
+                        st.caption(
+                            f"Current survey vs test start pressure: {n_conc} of {n_cmp} annulus(es) "
+                            f"match within tolerance. Agreement is computed against the "
+                            f"'Annular Casing Pressure Type' column of the uploaded file where it is set."
+                        )
+
+                        # Scatter: current survey pressure vs bleed-off start pressure
+                        sc = cmp_df.dropna(subset=["_actual_num", "Start pressure (psi)"]).copy()
+                        if not sc.empty:
+                            fig_bo = go.Figure()
+                            for origin_name, color in [
+                                ("SCP", "#dc3545"), ("Effet thermique", "#0dcaf0"), ("Indéterminé", "#6c757d"),
+                            ]:
+                                g = sc[sc["Computed origin"] == origin_name]
+                                if g.empty:
+                                    continue
+                                fig_bo.add_trace(go.Scatter(
+                                    x=g["_actual_num"],
+                                    y=g["Start pressure (psi)"],
+                                    mode="markers",
+                                    name=origin_name,
+                                    text=g["Well"] + " — " + g["Annulus"],
+                                    marker=dict(size=11, color=color),
+                                    hovertemplate="%{text}<br>Current=%{x:.0f} psi<br>Test start=%{y:.0f} psi<extra></extra>",
+                                ))
+                            max_v = float(max(sc["_actual_num"].max(), sc["Start pressure (psi)"].max())) * 1.05 + 1
+                            fig_bo.add_trace(go.Scatter(
+                                x=[0, max_v], y=[0, max_v], mode="lines",
+                                line=dict(color="gray", dash="dash"), name="Equal pressure",
+                            ))
+                            fig_bo.update_layout(
+                                xaxis_title="Current survey pressure (psi)",
+                                yaxis_title="Bleed-off test start pressure (psi)",
+                                height=440, margin=dict(t=30),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                            )
+                            st.plotly_chart(fig_bo, use_container_width=True)
+                            st.caption("Points on the dashed line: test start pressure equals the current survey pressure.")
+
+                        # Well-level summary
+                        st.markdown("**Well-level origin** (worst annulus governs)")
+                        well_sum = summarize_bleedoff_wells(cmp_df)
+                        st.dataframe(
+                            well_sum.style.map(lambda v: ORIGIN_COLORS.get(v, ""), subset=["Well origin"]),
+                            use_container_width=True, height=300,
+                        )
+
+                        # Annulus-level detail
+                        st.markdown("**Annulus-level detail**")
+                        detail_cols = [
+                            "Well", "Annulus", "Test date", "Tests on file", "Start pressure (psi)",
+                            "Bleed-to (psi)", "Pressure drop (psi)", "Bled (%)", "Build-up (psi)",
+                            "Recovery (%)", "Hours of BUP", "Computed origin", "Basis",
+                            "Current survey (psi)", "Survey date", "Δ test − current (psi)", "Δ %",
+                            "Comparison", "Reference type", "Agrees with reference",
+                        ]
+                        detail = cmp_df[detail_cols].copy()
+                        for c in ("Test date", "Survey date"):
+                            detail[c] = detail[c].apply(_fmt_date_display)
+                        for c in ("Bled (%)", "Recovery (%)", "Δ %"):
+                            detail[c] = detail[c].round(1)
+                        st.dataframe(
+                            detail.style.map(lambda v: ORIGIN_COLORS.get(v, ""), subset=["Computed origin"]),
+                            use_container_width=True, height=420,
+                        )
+
+                        st.download_button(
+                            "⬇️ Download bleed-off classification (.csv)",
+                            data=detail.to_csv(index=False).encode("utf-8"),
+                            file_name=f"bleedoff_origin_classification_{datetime.now().date()}.csv",
+                            mime="text/csv",
+                        )
 
     st.markdown("---")
     st.caption(

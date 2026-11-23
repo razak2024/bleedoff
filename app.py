@@ -1173,18 +1173,17 @@ def load_bleedoff_workbook(uploaded_file, sheet_name=0):
     return df.reset_index(drop=True)
 
 
-def classify_bleedoff_test(p0, dp, bup, hours, bleed_frac, window_h, recov_tol_pct, no_bleed_pct=1.0):
-    """SCP vs thermal rule for one bleed-off test.
+def classify_bleedoff_test(p0, dp, bup, hours, bleed_frac, window_h, return_frac, no_bleed_pct=1.0):
+    """Bleed-off classification rule.
 
-    0. If the pressure does not bleed at all (drop <= no_bleed_pct of start pressure),
-       the leak rate is greater than the bleed rate -> SCP.
-    1. Otherwise, bleed-down must remove at least bleed_frac of the start pressure, else inconclusive.
-    2. If the build-up returns to the original pressure:
-         - within window_h hours -> SCP (significant leak)
-         - after window_h hours  -> SCP (minor leak)
-    3. If it does not return to the original pressure:
-         - observed for >= window_h hours -> Effet thermique
-         - observed for < window_h hours  -> Indéterminé (not enough time observed)
+    0. Pressure does not bleed at all (drop <= no_bleed_pct of start pressure)
+       -> SCP (leak rate greater than bleed rate).
+    1. Partial bleed (drop < bleed_frac of start pressure) -> Indéterminé (not conclusive).
+    2. Bled below bleed_frac of start pressure:
+         a) build-up returns to >= return_frac of start pressure
+              - within window_h hours -> SCP (significant leak)
+              - after window_h hours  -> SCP (minor leak)
+         b) build-up does NOT return to >= return_frac of start pressure -> Effet thermique
 
     Returns (origin, bled_pct, recov_pct, basis)."""
     if pd.isna(p0) or p0 <= 0:
@@ -1198,45 +1197,41 @@ def classify_bleedoff_test(p0, dp, bup, hours, bleed_frac, window_h, recov_tol_p
             "SCP", bled_pct, np.nan,
             f"Pression ne purge pas ({bled_pct:.1f} %) — débit de fuite > débit de purge",
         )
+
     if dp < bleed_frac * p0:
         return (
             "Indéterminé", bled_pct, np.nan,
-            f"Purge insuffisante ({bled_pct:.0f} % < {bleed_frac * 100:.0f} %) — test non concluant",
+            f"Purge partielle ({bled_pct:.0f} % < {bleed_frac * 100:.0f} %) — test non concluant",
         )
 
     if pd.isna(bup):
         return "Données insuffisantes", bled_pct, np.nan, "Remontée (build-up) non renseignée"
 
     recov_pct = bup / p0 * 100.0
-    returned = bup >= p0 * (1 - recov_tol_pct / 100.0)
+    ret_label = f"{return_frac * 100:.0f} %"
 
-    if returned:
+    if bup >= return_frac * p0:
         if pd.isna(hours) or hours <= window_h:
             return (
                 "SCP", bled_pct, recov_pct,
-                f"Retour à la pression initiale ({recov_pct:.0f} %) en ≤ {window_h:.0f} h — fuite significative",
+                f"Retour au-dessus de {ret_label} ({recov_pct:.0f} %) en ≤ {window_h:.0f} h — fuite significative",
             )
         return (
             "SCP", bled_pct, recov_pct,
-            f"Retour à la pression initiale ({recov_pct:.0f} %) après {hours:.0f} h — fuite mineure",
+            f"Retour au-dessus de {ret_label} ({recov_pct:.0f} %) après {hours:.0f} h — fuite mineure",
         )
 
-    if pd.isna(hours):
-        return "Indéterminé", bled_pct, recov_pct, "Durée de build-up non renseignée"
-    if hours >= window_h:
-        return (
-            "Effet thermique", bled_pct, recov_pct,
-            f"Pas de retour à la pression initiale ({recov_pct:.0f} %) après {hours:.0f} h",
-        )
     return (
-        "Indéterminé", bled_pct, recov_pct,
-        f"Pas de retour à la pression initiale après {hours:.0f} h — observation insuffisante (< {window_h:.0f} h)",
+        "Effet thermique", bled_pct, recov_pct,
+        f"Pas de retour au-dessus de {ret_label} ({recov_pct:.0f} %) après purge",
     )
 
 
-def build_bleedoff_comparison(bleed_df, survey_latest, bleed_frac, window_h, recov_tol_pct, pct_tol, abs_tol, no_bleed_pct=1.0):
+def build_bleedoff_comparison(bleed_df, survey_latest, survey_history, bleed_frac, window_h,
+                              return_frac, pct_tol, abs_tol, no_bleed_pct=1.0):
     """Classify the most recent bleed-off test per well/annulus and compare its start
-    pressure with the current survey pressure of the same annulus."""
+    pressure with the latest NUMERIC value recorded for the same annulus in the survey
+    history (falls back to a status code / 'no reading' if none exists)."""
     d = bleed_df.copy()
     d["_wkey"] = d["wellbore"].map(_wkey)
     d = d.sort_values(["_wkey", "anp", "date"], na_position="first")
@@ -1247,30 +1242,42 @@ def build_bleedoff_comparison(bleed_df, survey_latest, bleed_frac, window_h, rec
     s["_wkey"] = s["wellbore"].map(_wkey)
     s = s.drop_duplicates("_wkey", keep="last").set_index("_wkey")
 
+    h = survey_history.copy()
+    h["_wkey"] = h["wellbore"].map(_wkey)
+
     rows = []
     for _, r in latest.iterrows():
         origin, bled_pct, recov_pct, basis = classify_bleedoff_test(
-            r["p0"], r["dp"], r["bup"], r["hours"], bleed_frac, window_h, recov_tol_pct, no_bleed_pct
+            r["p0"], r["dp"], r["bup"], r["hours"], bleed_frac, window_h, return_frac, no_bleed_pct
         )
 
-        actual, actual_code, survey_date = np.nan, None, pd.NaT
+        actual, survey_date, actual_disp = np.nan, pd.NaT, None
         delta, delta_pct, comp = np.nan, np.nan, "Puits absent du relevé"
+
         if r["_wkey"] in s.index:
-            srow = s.loc[r["_wkey"]]
-            actual = srow[r["anp"]]
-            actual_code = srow.get(f"{r['anp']}_code")
-            survey_date = srow.get("date", pd.NaT)
-            if _has_code(actual_code):
-                comp = "Non comparable (code de statut)"
-            elif pd.isna(actual):
-                comp = "Pas de lecture actuelle"
-            elif pd.isna(r["p0"]):
-                comp = "Pression d'essai manquante"
+            hist = h[(h["_wkey"] == r["_wkey"]) & h[r["anp"]].notna()]
+            if not hist.empty:
+                hist = hist.sort_values("date", na_position="first")
+                hrow = hist.iloc[-1]
+                actual = float(hrow[r["anp"]])
+                actual_disp = actual
+                survey_date = hrow.get("date", pd.NaT)
+                if pd.isna(r["p0"]):
+                    comp = "Pression d'essai manquante"
+                else:
+                    delta = r["p0"] - actual
+                    delta_pct = (delta / actual * 100.0) if actual > 0 else np.nan
+                    tol = max(abs_tol, pct_tol / 100.0 * actual)
+                    comp = "Concordant" if abs(delta) <= tol else "Écart"
             else:
-                delta = r["p0"] - actual
-                delta_pct = (delta / actual * 100.0) if actual > 0 else np.nan
-                tol = max(abs_tol, pct_tol / 100.0 * actual)
-                comp = "Concordant" if abs(delta) <= tol else "Écart"
+                srow = s.loc[r["_wkey"]]
+                survey_date = srow.get("date", pd.NaT)
+                code = srow.get(f"{r['anp']}_code")
+                if _has_code(code):
+                    actual_disp = code
+                    comp = "Non comparable (code de statut)"
+                else:
+                    comp = "Pas de lecture actuelle"
 
         ref = r["ref_type"]
         if ref == "—" or origin not in ("SCP", "Effet thermique"):
@@ -1293,9 +1300,9 @@ def build_bleedoff_comparison(bleed_df, survey_latest, bleed_frac, window_h, rec
             "Hours of BUP": r["hours"],
             "Computed origin": origin,
             "Basis": basis,
-            "Current survey (psi)": actual if not _has_code(actual_code) else actual_code,
-            "Survey date": survey_date,
-            "Δ test − current (psi)": delta,
+            "Latest recorded (psi)": actual_disp,
+            "Recorded date": survey_date,
+            "Δ test − recorded (psi)": delta,
             "Δ %": delta_pct,
             "Comparison": comp,
             "Reference type": ref,
@@ -1693,11 +1700,10 @@ with tabs[6]:
                 st.markdown("---")
                 st.markdown("##### 🧪 Bleed-off test results — SCP vs thermal classification")
                 st.caption(
-                    "Rule: if the pressure does not bleed at all (leak rate > bleed rate) → **SCP**. "
-                    "Otherwise bleed-down must remove at least 50 % of the start pressure. If the build-up "
-                    "returns to the original pressure → **SCP** (within 24 h = significant leak; "
-                    "later = minor leak). If it does not return to the original pressure after 24 h "
-                    "→ **Effet thermique**."
+                    "Rules: no bleed at all → **SCP** (leak rate > bleed rate). Bled below 50 % of start pressure "
+                    "and build-up returns above 50 % → **SCP** (within 24 h = significant; later = minor). "
+                    "Bled below 50 % but does not return above 50 % → **Effet thermique**. "
+                    "Partial bleed (between no-bleed limit and 50 %) → Indéterminé."
                 )
                 bleed_file = st.file_uploader(
                     "Upload bleed-off results Excel file (.xlsx / .xls)",
@@ -1719,8 +1725,8 @@ with tabs[6]:
                             "Return window (hours) for SCP", min_value=1.0, value=24.0, step=1.0
                         )
                     with r2:
-                        recov_tol_pct = st.number_input(
-                            "Return tolerance (% below start pressure)", min_value=0.0, value=5.0, step=1.0
+                        return_pct = st.number_input(
+                            "Return threshold (% of start pressure)", min_value=1.0, max_value=100.0, value=50.0, step=5.0
                         )
                     with r3:
                         pct_tol = st.number_input(
@@ -1741,10 +1747,19 @@ with tabs[6]:
                         st.warning("No bleed-off rows were recognized. Check the Well and Section columns.")
                     elif bleed_df_full is not None:
                         cmp_df = build_bleedoff_comparison(
-                            bleed_df_full, survey_df,
-                            bleed_frac_pct / 100.0, window_h, recov_tol_pct, pct_tol, abs_tol,
+                            bleed_df_full, survey_df, survey_df_full,
+                            bleed_frac_pct / 100.0, window_h, return_pct / 100.0, pct_tol, abs_tol,
                             no_bleed_pct,
                         )
+                        sel_sections = st.multiselect(
+                            "Filter by annulus section",
+                            ["A", "B", "C"],
+                            default=["A", "B", "C"],
+                            key="bo_section_filter",
+                        )
+                        cmp_df = cmp_df[cmp_df["Annulus"].isin(sel_sections)]
+                        if cmp_df.empty:
+                            st.info("No annulus selected in the section filter.")
                         n_cmp = len(cmp_df)
                         n_scp = int((cmp_df["Computed origin"] == "SCP").sum())
                         n_th = int((cmp_df["Computed origin"] == "Effet thermique").sum())
@@ -1786,7 +1801,7 @@ with tabs[6]:
                                     name=origin_name,
                                     text=g["Well"] + " — " + g["Annulus"],
                                     marker=dict(size=11, color=color),
-                                    hovertemplate="%{text}<br>Current=%{x:.0f} psi<br>Test start=%{y:.0f} psi<extra></extra>",
+                                    hovertemplate="%{text}<br>Recorded=%{x:.0f} psi<br>Test start=%{y:.0f} psi<extra></extra>",
                                 ))
                             max_v = float(max(sc["_actual_num"].max(), sc["Start pressure (psi)"].max())) * 1.05 + 1
                             fig_bo.add_trace(go.Scatter(
@@ -1794,13 +1809,13 @@ with tabs[6]:
                                 line=dict(color="gray", dash="dash"), name="Equal pressure",
                             ))
                             fig_bo.update_layout(
-                                xaxis_title="Current survey pressure (psi)",
+                                xaxis_title="Latest recorded pressure (psi)",
                                 yaxis_title="Bleed-off test start pressure (psi)",
                                 height=440, margin=dict(t=30),
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                             )
                             st.plotly_chart(fig_bo, use_container_width=True)
-                            st.caption("Points on the dashed line: test start pressure equals the current survey pressure.")
+                            st.caption("Points on the dashed line: test start pressure equals the latest recorded pressure.")
 
                         # Well-level summary
                         st.markdown("**Well-level origin** (worst annulus governs)")
@@ -1816,11 +1831,11 @@ with tabs[6]:
                             "Well", "Annulus", "Test date", "Tests on file", "Start pressure (psi)",
                             "Bleed-to (psi)", "Pressure drop (psi)", "Bled (%)", "Build-up (psi)",
                             "Recovery (%)", "Hours of BUP", "Computed origin", "Basis",
-                            "Current survey (psi)", "Survey date", "Δ test − current (psi)", "Δ %",
+                            "Latest recorded (psi)", "Recorded date", "Δ test − recorded (psi)", "Δ %",
                             "Comparison", "Reference type", "Agrees with reference",
                         ]
                         detail = cmp_df[detail_cols].copy()
-                        for c in ("Test date", "Survey date"):
+                        for c in ("Test date", "Recorded date"):
                             detail[c] = detail[c].apply(_fmt_date_display)
                         for c in ("Bled (%)", "Recovery (%)", "Δ %"):
                             detail[c] = detail[c].round(1)

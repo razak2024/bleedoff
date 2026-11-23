@@ -696,9 +696,16 @@ with st.container():
         "Pick a well further down to see its full pressure-over-time history."
     )
 
-    survey_file = st.file_uploader(
-        "Upload well survey Excel file (.xlsx / .xls)", type=["xlsx", "xls"], key="survey_uploader"
-    )
+    st.markdown("##### 📂 Survey workbooks — upload the oil template, the gas template, or both")
+    up_oil, up_gas = st.columns(2)
+    with up_oil:
+        oil_file = st.file_uploader(
+            "Oil template survey (.xlsx / .xls)", type=["xlsx", "xls"], key="oil_uploader"
+        )
+    with up_gas:
+        gas_file = st.file_uploader(
+            "Gas template survey (.xlsx / .xls)", type=["xlsx", "xls"], key="gas_uploader"
+        )
 
     with st.expander("⚙️ Classification thresholds", expanded=False):
         st.markdown("**Critical rule 1 — Annulus-A “near WHP”** (possible tubing-to-A communication)")
@@ -728,18 +735,28 @@ with st.container():
         with b4:
             high_thr = st.number_input("High ≤ (Severe above)", min_value=0.0, value=700.0, step=10.0)
 
-    if survey_file is None:
-        st.info("Upload an oil-template or gas-template survey workbook to run the screening.")
+    if oil_file is None and gas_file is None:
+        st.info("Upload the oil-template and/or gas-template survey workbook to run the screening.")
     else:
-        try:
-            xls = pd.ExcelFile(survey_file)
-            sheet = xls.sheet_names[0]
-            if len(xls.sheet_names) > 1:
-                sheet = st.selectbox("Sheet to use", xls.sheet_names)
-            survey_df_full = load_survey_workbook(survey_file, sheet_name=sheet)
-        except Exception as e:
-            survey_df_full = None
-            st.error(f"Could not read this workbook: {e}")
+        survey_frames = []
+        for template_label, f in (("Huile", oil_file), ("Gaz", gas_file)):
+            if f is None:
+                continue
+            try:
+                xls = pd.ExcelFile(f)
+                sheet = xls.sheet_names[0]
+                if len(xls.sheet_names) > 1:
+                    sheet = st.selectbox(
+                        f"Sheet to use — {template_label} template", xls.sheet_names,
+                        key=f"sheet_{template_label}",
+                    )
+                part = load_survey_workbook(f, sheet_name=sheet)
+                part["template"] = template_label
+                survey_frames.append(part)
+            except Exception as e:
+                st.error(f"Could not read the {template_label} workbook: {e}")
+
+        survey_df_full = pd.concat(survey_frames, ignore_index=True) if survey_frames else None
 
         if survey_df_full is not None:
             if survey_df_full.empty:
@@ -776,6 +793,13 @@ with st.container():
                 m5.metric("🔵 Status code only", n_status)
 
                 st.markdown("---")
+
+                tmpl_counts = survey_df.groupby("template")["wellbore"].nunique().to_dict()
+                st.caption(
+                    "Wells analysed — " + " | ".join(f"{k}: {v}" for k, v in tmpl_counts.items())
+                    + f" | total: {n_total}"
+                    + (" — wells present in both templates use their most recent reading." if (survey_df_full.groupby("wellbore")["template"].nunique() > 1).any() else "")
+                )
 
                 # Well classification distribution chart
                 counts = (
@@ -992,6 +1016,7 @@ with st.container():
 
                 display_cols = {
                     "wellbore": "Wellbore",
+                    "template": "Template",
                     "nature": "Nature",
                     "state": "Situation / State",
                     "whp_disp": "WHP (psig)",
